@@ -1176,32 +1176,44 @@ private static function fetch_donations_since($api_key, $start_unix) {
     WHERE status='paid'
   ");
 
-  // Group totals by designation/fund + optional write-in
+  // Group totals by designation/fund.
+  // Important: aggregate at fund level (beneficiary) so leaderboard stays
+  // consistent with donor wall expectations even when write-in variants exist.
   $rows = $wpdb->get_results("
     SELECT
       beneficiary_id,
       beneficiary_name,
-      writein_project,
       COUNT(*) as total_gifts,
       COALESCE(SUM(amount),0) as total_raised
     FROM $t
     WHERE status='paid'
-    GROUP BY beneficiary_id, beneficiary_name, writein_project
+    GROUP BY beneficiary_id, beneficiary_name
     ORDER BY total_raised DESC
   ", ARRAY_A);
 
   $by_des = [];
   foreach ($rows as $r) {
-    $key = ($r['beneficiary_id'] ?: $r['beneficiary_name']) . '|' . ($r['writein_project'] ?? '');
-    $label = $r['beneficiary_name'] ?: 'Unspecified';
-    if (!empty($r['writein_project'])) $label .= ' — ' . $r['writein_project'];
+    $label = trim((string)($r['beneficiary_name'] ?? ''));
+    if ($label === '') $label = 'Unspecified';
 
-    $by_des[$key] = [
-      'beneficiary_id' => $r['beneficiary_id'],
-      'designation' => $label,
-      'total_raised' => (float)$r['total_raised'],
-      'total_gifts' => (int)$r['total_gifts'],
-    ];
+    // Prefer beneficiary_id as the stable aggregation key.
+    // Fallback to normalized label so naming/case differences don't split rows.
+    $key = trim((string)($r['beneficiary_id'] ?? ''));
+    if ($key === '') {
+      $key = 'name:' . strtolower(preg_replace('/\s+/', ' ', $label));
+    }
+
+    if (!isset($by_des[$key])) {
+      $by_des[$key] = [
+        'beneficiary_id' => (string)($r['beneficiary_id'] ?? ''),
+        'designation' => $label,
+        'total_raised' => 0,
+        'total_gifts' => 0,
+      ];
+    }
+
+    $by_des[$key]['total_raised'] += (float)$r['total_raised'];
+    $by_des[$key]['total_gifts'] += (int)$r['total_gifts'];
   }
 
   // Recent donors (latest 50)
