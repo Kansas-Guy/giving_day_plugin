@@ -14,6 +14,7 @@ class FHSU_GivingDay_Stats {
   const OPT_CACHE          = 'fhsu_gd_stats_cache';
   const OPT_LAST_SYNC_RUN  = 'fhsu_gd_last_sync_run';
   const OPT_LAST_CRON_RUN  = 'fhsu_gd_last_cron_run';
+  const OPT_CRON_TOKEN     = 'fhsu_gd_cron_token';
 
   const CRON_HOOK = 'fhsu_gd_sync_cron';
 
@@ -33,6 +34,9 @@ class FHSU_GivingDay_Stats {
     add_action('admin_post_fhsu_gd_sync_now', [__CLASS__, 'handle_sync_now']);
     add_action('admin_post_fhsu_gd_rebuild_cache', [__CLASS__, 'handle_rebuild_cache']);
     add_action('admin_post_fhsu_gd_reset', [__CLASS__, 'handle_reset']);
+    add_action('admin_post_fhsu_gd_generate_cron_token', [__CLASS__, 'handle_generate_cron_token']);
+    add_action('admin_post_fhsu_gd_external_cron', [__CLASS__, 'handle_external_cron']);
+    add_action('admin_post_nopriv_fhsu_gd_external_cron', [__CLASS__, 'handle_external_cron']);
     add_action('init', [__CLASS__, 'ensure_cron_scheduled']);
     add_action(self::CRON_HOOK, [__CLASS__, 'run_sync']);
     add_filter('cron_schedules', [__CLASS__, 'add_cron_schedules']);
@@ -70,6 +74,10 @@ class FHSU_GivingDay_Stats {
     // Default start unix if none set (leave blank for now; user sets it)
     if (get_option(self::OPT_START_UNIX) === false) {
       update_option(self::OPT_START_UNIX, '', false);
+    }
+    
+    if (get_option(self::OPT_CRON_TOKEN) === false) {
+      update_option(self::OPT_CRON_TOKEN, wp_generate_password(32, false, false), false);
     }
 
     // Schedule cron every 2 minutes (WP-Cron is best-effort; we’ll tune as needed)
@@ -162,11 +170,23 @@ class FHSU_GivingDay_Stats {
     if (isset($_GET['db_cleared'])) {
       echo '<div class="notice notice-success is-dismissible"><p><strong>Donations database cleared.</strong></p></div>';
     }
+    if (isset($_GET['token_regenerated'])) {
+      echo '<div class="notice notice-success is-dismissible"><p><strong>External cron token regenerated.</strong> Update your cPanel cron URL.</p></div>';
+    }
     
   
     $next_cron = wp_next_scheduled(self::CRON_HOOK);
     $last_sync_run = get_option(self::OPT_LAST_SYNC_RUN, '');
     $last_cron_run = get_option(self::OPT_LAST_CRON_RUN, '');
+    $cron_token = get_option(self::OPT_CRON_TOKEN, '');
+    if (!$cron_token) {
+      $cron_token = wp_generate_password(32, false, false);
+      update_option(self::OPT_CRON_TOKEN, $cron_token, false);
+    }
+    $external_cron_url = add_query_arg([
+      'action' => 'fhsu_gd_external_cron',
+      'token'  => $cron_token,
+    ], admin_url('admin-post.php'));
     
     echo '<h2>Cron Status</h2>';
     
@@ -183,6 +203,16 @@ class FHSU_GivingDay_Stats {
     echo '<p><strong>Last cron run:</strong> ' .
          ($last_cron_run ? esc_html(date_i18n('Y-m-d H:i:s', $last_cron_run)) : '(never)') .
          '</p>';
+
+    echo '<p><strong>External cron URL (use this in cPanel):</strong><br><code>' . esc_html($external_cron_url) . '</code></p>';
+    echo '<p class="description">If WP-Cron is disabled or unreliable on your host, schedule this URL in cPanel every 2–5 minutes.</p>';
+    
+    $nonce_gen_token = wp_create_nonce('fhsu_gd_generate_cron_token');
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:10px;">';
+    echo '<input type="hidden" name="action" value="fhsu_gd_generate_cron_token" />';
+    echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($nonce_gen_token) . '" />';
+    submit_button('Regenerate External Cron Token', 'secondary', 'submit', false);
+    echo '</form>';
 
 
     echo '<div class="wrap"><h1>Giving Day Stats</h1>';
@@ -348,6 +378,35 @@ class FHSU_GivingDay_Stats {
   wp_redirect(admin_url('options-general.php?page=fhsu-givingday-stats&db_cleared=1'));
   exit;
 }
+
+  public static function handle_generate_cron_token() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    check_admin_referer('fhsu_gd_generate_cron_token');
+
+    update_option(self::OPT_CRON_TOKEN, wp_generate_password(32, false, false), false);
+
+    wp_redirect(admin_url('options-general.php?page=fhsu-givingday-stats&token_regenerated=1'));
+    exit;
+  }
+
+  public static function handle_external_cron() {
+    $expected = (string)get_option(self::OPT_CRON_TOKEN, '');
+    $provided = isset($_REQUEST['token']) ? sanitize_text_field((string)$_REQUEST['token']) : '';
+
+    if (!$expected || !$provided || !hash_equals($expected, $provided)) {
+      status_header(403);
+      wp_die('Forbidden');
+    }
+
+    $result = self::run_sync(false);
+
+    if (is_wp_error($result)) {
+      status_header(500);
+      wp_die('Giving Day sync failed: ' . esc_html($result->get_error_message()));
+    }
+
+    wp_die('OK');
+  }
 
   private static function create_tables() {
   global $wpdb;
@@ -1117,32 +1176,44 @@ private static function fetch_donations_since($api_key, $start_unix) {
     WHERE status='paid'
   ");
 
-  // Group totals by designation/fund + optional write-in
+  // Group totals by designation/fund.
+  // Important: aggregate at fund level (beneficiary) so leaderboard stays
+  // consistent with donor wall expectations even when write-in variants exist.
   $rows = $wpdb->get_results("
     SELECT
       beneficiary_id,
       beneficiary_name,
-      writein_project,
       COUNT(*) as total_gifts,
       COALESCE(SUM(amount),0) as total_raised
     FROM $t
     WHERE status='paid'
-    GROUP BY beneficiary_id, beneficiary_name, writein_project
+    GROUP BY beneficiary_id, beneficiary_name
     ORDER BY total_raised DESC
   ", ARRAY_A);
 
   $by_des = [];
   foreach ($rows as $r) {
-    $key = ($r['beneficiary_id'] ?: $r['beneficiary_name']) . '|' . ($r['writein_project'] ?? '');
-    $label = $r['beneficiary_name'] ?: 'Unspecified';
-    if (!empty($r['writein_project'])) $label .= ' — ' . $r['writein_project'];
+    $label = trim((string)($r['beneficiary_name'] ?? ''));
+    if ($label === '') $label = 'Unspecified';
 
-    $by_des[$key] = [
-      'beneficiary_id' => $r['beneficiary_id'],
-      'designation' => $label,
-      'total_raised' => (float)$r['total_raised'],
-      'total_gifts' => (int)$r['total_gifts'],
-    ];
+    // Prefer beneficiary_id as the stable aggregation key.
+    // Fallback to normalized label so naming/case differences don't split rows.
+    $key = trim((string)($r['beneficiary_id'] ?? ''));
+    if ($key === '') {
+      $key = 'name:' . strtolower(preg_replace('/\s+/', ' ', $label));
+    }
+
+    if (!isset($by_des[$key])) {
+      $by_des[$key] = [
+        'beneficiary_id' => (string)($r['beneficiary_id'] ?? ''),
+        'designation' => $label,
+        'total_raised' => 0,
+        'total_gifts' => 0,
+      ];
+    }
+
+    $by_des[$key]['total_raised'] += (float)$r['total_raised'];
+    $by_des[$key]['total_gifts'] += (int)$r['total_gifts'];
   }
 
   // Recent donors (latest 50)
